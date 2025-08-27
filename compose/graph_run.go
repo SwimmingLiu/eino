@@ -104,8 +104,21 @@ func runnableTransform(ctx context.Context, r *composableRunnable, input any, op
 	return r.t(ctx, input.(streamReader), opts...)
 }
 
+/**
+ * 执行图的核心方法，支持同步调用和流式处理两种模式
+ *
+ * @param ctx 上下文信息，用于控制执行过程和传递状态
+ * @param isStream 是否为流式处理模式，决定使用invoke还是transform包装器
+ * @param input 图的输入数据，可以是任意类型
+ * @param opts 执行选项，包含检查点、状态修改器等配置
+ * @return result 图执行的最终结果
+ * @return err 执行过程中的错误信息
+ */
 func (r *runner) run(ctx context.Context, isStream bool, input any, opts ...Option) (result any, err error) {
-	// Choose the appropriate wrapper function based on whether we're handling a stream or not.
+	/*
+	 * 根据执行模式选择合适的包装函数
+	 * 流式模式使用transform包装器，同步模式使用invoke包装器
+	 */
 	haveOnStart := false
 	defer func() {
 		if !haveOnStart {
@@ -123,11 +136,18 @@ func (r *runner) run(ctx context.Context, isStream bool, input any, opts ...Opti
 		runWrapper = runnableTransform
 	}
 
-	// Initialize channel and task managers.
+	/*
+	 * 初始化通道管理器和任务管理器
+	 * 通道管理器负责节点间的数据流转，任务管理器负责并发执行控制
+	 */
 	cm := r.initChannelManager(isStream)
 	tm := r.initTaskManager(runWrapper, opts...)
 	maxSteps := r.options.maxRunSteps
 
+	/*
+	 * 处理最大执行步数限制
+	 * DAG模式不支持步数限制，普通模式需要验证步数有效性
+	 */
 	if r.dag {
 		for i := range opts {
 			if opts[i].maxRunSteps > 0 {
@@ -135,7 +155,7 @@ func (r *runner) run(ctx context.Context, isStream bool, input any, opts ...Opti
 			}
 		}
 	} else {
-		// Update maxSteps if provided in options.
+		/* 从选项中更新最大步数配置 */
 		for i := range opts {
 			if opts[i].maxRunSteps > 0 {
 				maxSteps = opts[i].maxRunSteps
@@ -146,22 +166,31 @@ func (r *runner) run(ctx context.Context, isStream bool, input any, opts ...Opti
 		}
 	}
 
-	// Extract and validate options for each node.
+	/*
+	 * 提取并验证每个节点的执行选项
+	 * 选项映射用于在执行时为特定节点提供定制化参数
+	 */
 	optMap, extractErr := extractOption(r.chanSubscribeTo, opts...)
 	if extractErr != nil {
 		return nil, newGraphRunError(fmt.Errorf("graph extract option fail: %w", extractErr))
 	}
 
-	// Extract CheckPointID
+	/*
+	 * 提取检查点相关信息
+	 * 包括检查点ID、写入目标、状态修改器和强制新运行标志
+	 */
 	checkPointID, writeToCheckPointID, stateModifier, forceNewRun := getCheckPointInfo(opts...)
 	if checkPointID != nil && r.checkPointer.store == nil {
 		return nil, newGraphRunError(fmt.Errorf("receive checkpoint id but have not set checkpoint store"))
 	}
 
-	// Extract subgraph
+	/* 提取子图信息，用于判断当前执行上下文 */
 	path, isSubGraph := getNodeKey(ctx)
 
-	// load checkpoint from ctx/store or init graph
+	/*
+	 * 从检查点或初始化图状态
+	 * 支持从上下文或存储中加载检查点进行状态恢复
+	 */
 	initialized := false
 	var nextTasks []*task
 	if cp := getCheckPointFromCtx(ctx); cp != nil {
@@ -273,37 +302,56 @@ func (r *runner) run(ctx context.Context, isStream bool, input any, opts ...Opti
 	}
 
 	var lastCompletedTask []*task
-	// Main execution loop.
+	/*
+	 * 主执行循环：图执行的核心控制逻辑
+	 * 循环执行三个步骤：提交任务 -> 等待完成 -> 计算下一个任务
+	 * 直到所有节点执行完成或遇到错误/中断
+	 */
 	for step := 0; ; step++ {
-		// Check for context cancellation.
+		/* 检查上下文取消状态，支持外部中断 */
 		select {
 		case <-ctx.Done():
 			_ = tm.waitAll()
 			return nil, newGraphRunError(fmt.Errorf("context has been canceled: %w", ctx.Err()))
 		default:
 		}
+		/* 检查最大步数限制（DAG模式无此限制） */
 		if !r.dag && step >= maxSteps {
 			return nil, newGraphRunError(ErrExceedMaxSteps)
 		}
 
-		// 1. submit next tasks
-		// 2. get completed tasks
-		// 3. calculate next tasks
+		/*
+		 * 三阶段执行模式：
+		 * 1. 提交下一批待执行任务
+		 * 2. 等待当前批次任务完成
+		 * 3. 根据完成结果计算下一批任务
+		 */
 
+		/* 第一阶段：提交任务到任务管理器进行并发执行 */
 		err = tm.submit(nextTasks)
 		if err != nil {
 			return nil, newGraphRunError(fmt.Errorf("failed to submit tasks: %w", err))
 		}
+		/* 第二阶段：等待当前批次的所有任务执行完成 */
 		var completedTasks []*task
 		completedTasks = tm.wait()
 
+		/* 创建中断信息临时存储，用于跟踪各种中断状态 */
 		tempInfo := newInterruptTempInfo()
 
+		/*
+		 * 解析已完成任务的中断状态
+		 * 检测子图中断、重运行节点和执行后中断等情况
+		 */
 		err = r.resolveInterruptCompletedTasks(tempInfo, completedTasks)
 		if err != nil {
 			return nil, err // err has been wrapped
 		}
 
+		/*
+		 * 处理子图中断和重运行节点的复合中断场景
+		 * 需要等待所有任务完成，保存状态并返回中断信息
+		 */
 		if len(tempInfo.subGraphInterrupts)+len(tempInfo.interruptRerunNodes) > 0 {
 			cpt := tm.waitAll()
 			err = r.resolveInterruptCompletedTasks(tempInfo, cpt)
@@ -311,10 +359,12 @@ func (r *runner) run(ctx context.Context, isStream bool, input any, opts ...Opti
 				return nil, err // err has been wrapped
 			}
 
-			// subgraph has interrupted
-			// save other completed tasks to channel
-			// save interrupted subgraph as next task with SkipPreHandler
-			// report current graph interrupt info
+			/*
+			 * 子图中断处理流程：
+			 * 1. 保存其他已完成任务到通道
+			 * 2. 将中断的子图保存为下次任务（跳过预处理器）
+			 * 3. 报告当前图的中断信息
+			 */
 			return nil, r.handleInterruptWithSubGraphAndRerunNodes(
 				ctx,
 				tempInfo,
@@ -326,16 +376,22 @@ func (r *runner) run(ctx context.Context, isStream bool, input any, opts ...Opti
 			)
 		}
 
+		/* 验证是否有任务完成，防止死循环 */
 		if len(completedTasks) == 0 {
 			return nil, newGraphRunError(fmt.Errorf("no tasks to execute, last completed nodes: %v", printTask(lastCompletedTask)))
 		}
 		lastCompletedTask = completedTasks
 
+		/*
+		 * 第三阶段：根据已完成任务计算下一批待执行任务
+		 * 这是图执行的核心调度逻辑，决定执行路径和数据流向
+		 */
 		var isEnd bool
 		nextTasks, result, isEnd, err = r.calculateNextTasks(ctx, completedTasks, isStream, cm, optMap)
 		if err != nil {
 			return nil, newGraphRunError(fmt.Errorf("failed to calculate next tasks: %w", err))
 		}
+		/* 检查是否到达END节点，若是则返回最终结果 */
 		if isEnd {
 			return result, nil
 		}
@@ -584,23 +640,48 @@ func (r *runner) handleInterruptWithSubGraphAndRerunNodes(
 	return &interruptError{Info: intInfo}
 }
 
+/**
+ * 计算下一批待执行任务的核心调度方法
+ * 根据已完成任务的输出，更新通道状态并确定下一步执行路径
+ *
+ * @param ctx 执行上下文，包含状态和配置信息
+ * @param completedTasks 已完成的任务列表，包含输出结果
+ * @param isStream 是否为流式处理模式
+ * @param cm 通道管理器，负责节点间数据流转
+ * @param optMap 节点选项映射，为特定节点提供执行参数
+ * @return nextTasks 下一批待执行的任务列表
+ * @return result 如果到达END节点，返回最终结果
+ * @return isEnd 是否已到达图的结束节点
+ * @return err 计算过程中的错误信息
+ */
 func (r *runner) calculateNextTasks(ctx context.Context, completedTasks []*task, isStream bool, cm *channelManager, optMap map[string][]any) ([]*task, any, bool, error) {
+	/*
+	 * 解析已完成任务的输出结果
+	 * 将任务输出转换为通道写入值和控制依赖关系
+	 */
 	writeChannelValues, controls, err := r.resolveCompletedTasks(ctx, completedTasks, isStream, cm)
 	if err != nil {
 		return nil, nil, false, err
 	}
+	/*
+	 * 更新通道状态并获取可执行的节点映射
+	 * 通道管理器根据依赖关系决定哪些节点已准备好执行
+	 */
 	nodeMap, err := cm.updateAndGet(ctx, writeChannelValues, controls)
 	if err != nil {
 		return nil, nil, false, fmt.Errorf("failed to update and get channels: %w", err)
 	}
 	var nextTasks []*task
 	if len(nodeMap) > 0 {
-		// Check if we've reached the END node.
+		/* 检查是否到达END节点，若是则返回最终执行结果 */
 		if v, ok := nodeMap[END]; ok {
 			return nil, v, true, nil
 		}
 
-		// Create and submit the next batch of tasks.
+		/*
+		 * 创建下一批执行任务
+		 * 为每个准备好的节点创建对应的任务实例
+		 */
 		nextTasks, err = r.createTasks(ctx, nodeMap, optMap)
 		if err != nil {
 			return nil, nil, false, fmt.Errorf("failed to create tasks: %w", err)
@@ -702,33 +783,62 @@ func (r *runner) restoreTasks(
 	return ret, nil
 }
 
+/**
+ * 解析已完成任务并生成通道写入值和依赖关系
+ * 处理任务输出的分发，包括分支计算和数据复制逻辑
+ *
+ * @param ctx 执行上下文
+ * @param completedTasks 已完成的任务列表
+ * @param isStream 是否为流式处理模式
+ * @param cm 通道管理器实例
+ * @return writeChannelValues 需要写入各通道的值映射
+ * @return newDependencies 新产生的依赖关系映射
+ * @return err 处理过程中的错误信息
+ */
 func (r *runner) resolveCompletedTasks(ctx context.Context, completedTasks []*task, isStream bool, cm *channelManager) (map[string]map[string]any, map[string][]string, error) {
 	writeChannelValues := make(map[string]map[string]any)
 	newDependencies := make(map[string][]string)
+
+	/* 遍历所有已完成的任务，处理其输出和依赖关系 */
 	for _, t := range completedTasks {
+		/* 处理控制依赖：记录当前任务对其控制目标的依赖关系 */
 		for _, key := range t.call.controls {
 			newDependencies[key] = append(newDependencies[key], t.nodeKey)
 		}
 
-		// update channel & new_next_tasks
+		/*
+		 * 准备任务输出的多份副本
+		 * 为直接写入目标和分支目标分别创建输出副本
+		 */
 		vs := copyItem(t.output, len(t.call.writeTo)+len(t.call.writeToBranches)*2)
+
+		/*
+		 * 计算分支逻辑确定的下一步节点
+		 * 根据分支条件动态决定数据流向
+		 */
 		nextNodeKeys, err := r.calculateBranch(ctx, t.nodeKey, t.call,
 			vs[len(t.call.writeTo)+len(t.call.writeToBranches):], isStream, cm)
 		if err != nil {
 			return nil, nil, fmt.Errorf("calculate next step fail, node: %s, error: %w", t.nodeKey, err)
 		}
 
+		/* 为分支计算出的节点建立依赖关系 */
 		for _, key := range nextNodeKeys {
 			newDependencies[key] = append(newDependencies[key], t.nodeKey)
 		}
+		/* 合并直接写入目标和分支计算出的目标节点 */
 		nextNodeKeys = append(nextNodeKeys, t.call.writeTo...)
 
-		// If branches generates more than one successor, the inputs need to be copied accordingly.
+		/*
+		 * 处理多后继节点的数据分发
+		 * 当分支产生多个后继节点时，需要相应地复制输入数据
+		 */
 		if len(nextNodeKeys) > 0 {
 			toCopyNum := len(nextNodeKeys) - len(t.call.writeTo) - len(t.call.writeToBranches)
 			nVs := copyItem(vs[len(t.call.writeTo)+len(t.call.writeToBranches)-1], toCopyNum+1)
 			vs = append(vs[:len(t.call.writeTo)+len(t.call.writeToBranches)-1], nVs...)
 
+			/* 为每个后继节点分配对应的输出数据副本 */
 			for i, next := range nextNodeKeys {
 				if _, ok := writeChannelValues[next]; !ok {
 					writeChannelValues[next] = make(map[string]any)
